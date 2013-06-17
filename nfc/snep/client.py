@@ -120,6 +120,8 @@ class SnepClient(object):
                     response_code = ord(snep_response[1])
                     if response_code != 0x81:
                         raise SnepError(response_code)
+            else:
+                raise SnepError(0xE2)
         finally:
             if self.release_connection:
                 self.close()
@@ -129,7 +131,8 @@ class SnepError(Exception):
               0xC1: "resource exceeds data size limit",
               0xC2: "malformed request not understood",
               0xE0: "unsupported functionality requested",
-              0xE1: "unsupported protocol version"}
+              0xE1: "unsupported protocol version",
+              0xE2: "unable to send request to the SNEP server",}
 
     def __init__(self, err):
         self.args = (err, SnepError.strerr.get(err, ""))
