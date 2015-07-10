@@ -1,6 +1,8 @@
-========================
+.. _ndef-tutorial:
+
+************************
 NFC Data Exchange Format
-========================
+************************
 
 NDEF (NFC Data Exchange Format) is a binary message format to exchange
 application-defined payloads between NFC Forum Devices or to store
@@ -177,8 +179,8 @@ The serialized form of an :class:`nfc.ndef.Message` object is produced with :fun
 '\x99\x01\x0f\x03Tid1\x02enHello World!Y\x01\x0e\x03Tid2\x02deHallo Welt!'
 
 
-Specialized Records
-===================
+Specific Records
+================
 
 Text Record
 -----------

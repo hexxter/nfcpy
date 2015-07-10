@@ -61,7 +61,7 @@ class TransmissionControlObject(object):
         def __getattr__(self, name):
             return self.value[name]
 
-    def __init__(self):
+    def __init__(self, send_miu, recv_miu):
         self.lock = threading.RLock()
         self.mode = TransmissionControlObject.Mode()
         self.state = TransmissionControlObject.State()
@@ -69,6 +69,8 @@ class TransmissionControlObject(object):
         self.recv_queue = collections.deque()
         self.send_ready = threading.Condition(self.lock)
         self.recv_ready = threading.Condition(self.lock)
+        self.recv_miu = recv_miu
+        self.send_miu = send_miu
         self.recv_buf = 1
         self.send_buf = 1
         self.addr = None
@@ -87,6 +89,10 @@ class TransmissionControlObject(object):
             with self.lock: self.recv_buf = int(value)
 
     def getsockopt(self, option):
+        if option == SO_SNDMIU:
+            return self.send_miu
+        if option == SO_RCVMIU:
+            return self.recv_miu
         if option == SO_SNDBUF:
             return self.send_buf
         if option == SO_RCVBUF:
@@ -120,11 +126,7 @@ class TransmissionControlObject(object):
         with self.recv_ready:
             try: return self.recv_queue.popleft()
             except IndexError: self.recv_ready.wait()
-            
-            try:
-                return self.recv_queue.popleft()
-            except:
-                return None
+            return self.recv_queue.popleft()
 
     def close(self):
         with self.lock:
@@ -164,10 +166,8 @@ class RawAccessPoint(TransmissionControlObject):
     ESTABLISHED   close()     SHUTDOWN
     ============= =========== ============
     """
-    def __init__(self, send_miu, recv_miu):
-        super(RawAccessPoint, self).__init__()
-        self.recv_miu = recv_miu
-        self.send_miu = send_miu
+    def __init__(self, recv_miu):
+        super(RawAccessPoint, self).__init__(128, recv_miu)
         self.state.ESTABLISHED = True
 
     def __str__(self):
@@ -226,10 +226,8 @@ class LogicalDataLink(TransmissionControlObject):
     ESTABLISHED   close()     SHUTDOWN
     ============= =========== ============
     """
-    def __init__(self, send_miu, recv_miu):
-        super(LogicalDataLink, self).__init__()
-        self.recv_miu = recv_miu
-        self.send_miu = send_miu
+    def __init__(self, recv_miu):
+        super(LogicalDataLink, self).__init__(128, recv_miu)
         self.state.ESTABLISHED = True
 
     def __str__(self):
@@ -316,15 +314,13 @@ class DataLinkConnection(TransmissionControlObject):
     CLOSE_WAIT    close()     SHUTDOWN
     ============= =========== ============
     """
-    def __init__(self, recv_miu=128, recv_win=1):
-        super(DataLinkConnection, self).__init__()
+    def __init__(self, recv_miu, recv_win):
+        super(DataLinkConnection, self).__init__(128, recv_miu)
         self.state.CLOSED = True
         self.acks_ready = threading.Condition(self.lock)
         self.acks_recvd = 0 # received acknowledgements
         self.recv_confs = 0 # outstanding receive confirmations
         self.send_token = threading.Condition(self.lock)
-        self.recv_miu = recv_miu
-        self.send_miu = 128
         self.recv_buf = recv_win
         self.recv_win = recv_win # RW(Local)
         self.recv_cnt = 0        # V(R)
@@ -361,10 +357,6 @@ class DataLinkConnection(TransmissionControlObject):
             super(DataLinkConnection, self).setsockopt(option, value)
 
     def getsockopt(self, option):
-        if option == SO_SNDMIU:
-            return self.send_miu
-        if option == SO_RCVMIU:
-            return self.recv_miu
         if option == SO_RCVBUF:
             return self.recv_win
         if option == SO_SNDBSY:
@@ -394,20 +386,19 @@ class DataLinkConnection(TransmissionControlObject):
             try: pdu = super(DataLinkConnection, self).recv()
             except IndexError: raise Error(errno.EPIPE)
             self.recv_buf -= 1
-            if pdu != None:
-                if isinstance(pdu, Connect):
-                    dlc = DataLinkConnection(self.recv_miu, self.recv_win)
-                    dlc.addr = self.addr
-                    dlc.peer = pdu.ssap
-                    dlc.send_miu = pdu.miu
-                    dlc.send_win = pdu.rw
-                    pdu = ConnectionComplete(dlc.peer, dlc.addr)
-                    pdu.miu, pdu.rw = dlc.recv_miu, dlc.recv_win
-                    log.info("accepting CONNECT from SAP %d" % dlc.peer)
-                    dlc.state.ESTABLISHED = True
-                    self.send_queue.append(pdu)
-                    return dlc
-                raise RuntimeError("only CONNECT expected, not "+ pdu.name)
+            if isinstance(pdu, Connect):
+                dlc = DataLinkConnection(self.recv_miu, self.recv_win)
+                dlc.addr = self.addr
+                dlc.peer = pdu.ssap
+                dlc.send_miu = pdu.miu
+                dlc.send_win = pdu.rw
+                pdu = ConnectionComplete(dlc.peer, dlc.addr)
+                pdu.miu, pdu.rw = dlc.recv_miu, dlc.recv_win
+                log.info("accepting CONNECT from SAP %d" % dlc.peer)
+                dlc.state.ESTABLISHED = True
+                self.send_queue.append(pdu)
+                return dlc
+            raise RuntimeError("only CONNECT expected, not "+ pdu.name)
 
     def connect(self, dest):
         with self.lock:
@@ -425,20 +416,20 @@ class DataLinkConnection(TransmissionControlObject):
             else: raise TypeError("connect() arg *dest* must be int or string")
             self.state.CONNECT = True
             self.send_queue.append(pdu)
-            pdu = super(DataLinkConnection, self).recv()
-            if pdu != None:
-                if isinstance(pdu, DisconnectedMode):
-                    self.log("connect rejected with reason {0}".format(pdu.reason))
-                    self.state.CLOSED = True
-                    raise ConnectRefused(pdu.reason)
-                if isinstance(pdu, ConnectionComplete):
-                    self.peer = pdu.ssap
-                    self.recv_buf = self.recv_win
-                    self.send_miu = pdu.miu
-                    self.send_win = pdu.rw
-                    self.state.ESTABLISHED = True
-                    return
-                raise RuntimeError("only CC or DM expected, not " + pdu.name)
+            try: pdu = super(DataLinkConnection, self).recv()
+            except IndexError: raise Error(errno.EPIPE)
+            if isinstance(pdu, DisconnectedMode):
+                self.log("connect rejected with reason {0}".format(pdu.reason))
+                self.state.CLOSED = True
+                raise ConnectRefused(pdu.reason)
+            if isinstance(pdu, ConnectionComplete):
+                self.peer = pdu.ssap
+                self.recv_buf = self.recv_win
+                self.send_miu = pdu.miu
+                self.send_win = pdu.rw
+                self.state.ESTABLISHED = True
+                return
+            raise RuntimeError("only CC or DM expected, not " + pdu.name)
 
     @property
     def send_window_slots(self):
@@ -477,18 +468,17 @@ class DataLinkConnection(TransmissionControlObject):
                 raise Error(errno.ENOTCONN)
             try: pdu = super(DataLinkConnection, self).recv()
             except IndexError: return None
-            if pdu != None:
-                if isinstance(pdu, Information):
-                    self.recv_confs += 1
-                    if self.recv_confs > self.recv_win:
-                        self.err("recv_confs({0}) > recv_win({1})"
-                                 .format(self.recv_confs, self.recv_win))
-                        raise RuntimeError("recv_confs > recv_win")
-                    return pdu.sdu
-                if isinstance(pdu, Disconnect):
-                    self.close()
-                    return None
-                raise RuntimeError("only I or DISC expected, not "+ pdu.name)
+            if isinstance(pdu, Information):
+                self.recv_confs += 1
+                if self.recv_confs > self.recv_win:
+                    self.err("recv_confs({0}) > recv_win({1})"
+                             .format(self.recv_confs, self.recv_win))
+                    raise RuntimeError("recv_confs > recv_win")
+                return pdu.sdu
+            if isinstance(pdu, Disconnect):
+                self.close()
+                return None
+            raise RuntimeError("only I or DISC expected, not "+ pdu.name)
 
     def poll(self, event, timeout):
         if self.state.SHUTDOWN:
@@ -523,7 +513,8 @@ class DataLinkConnection(TransmissionControlObject):
                 self.acks_ready.notify_all()
                 pdu = Disconnect(self.peer, self.addr)
                 self.send_queue.append(pdu)
-                pdu = super(DataLinkConnection, self).recv()
+                try: super(DataLinkConnection, self).recv()
+                except IndexError: pass
             super(DataLinkConnection, self).close()
             self.acks_ready.notify_all()
             self.send_token.notify_all()
